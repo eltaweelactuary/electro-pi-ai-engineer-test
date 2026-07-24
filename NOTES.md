@@ -2,66 +2,133 @@
 
 ## Section 1 — LiveKit
 
-### How I'd handle barge-in (interruption)
+### Barge-in / interruption handling
 
-So the main issue is: what happens when the user starts talking while the agent is still speaking?
-In LiveKit's AgentSession, there's VAD (voice activity detection) baked in. You'd set something like `interrupt_on_speech=True` in the session config — once the user speaks, TTS playback stops immediately and whatever the LLM was generating gets flushed.
+LiveKit's `AgentSession` runs Voice Activity Detection (VAD, typically via
+`silero.VAD`) alongside a turn-detection model. Barge-in falls out of that
+plumbing rather than being something the Agent class handles directly:
 
-The tricky part is state management. When interrupted, you don't want to keep the half-spoken response in context — it confuses the LLM on the next turn. My approach would be:
-- Track what was actually "committed" (fully spoken to the user) vs what was cut off
-- Only add committed text to conversation history
-- Tune `min_speech_duration_ms` to maybe 250-300ms so random background noise doesn't trigger false interrupts
-
-I experimented a bit with this during development and found that without the duration threshold, even keyboard typing could trigger barge-in. Annoying.
+- When VAD detects user speech while the agent is still speaking, the session
+  cancels the current TTS synthesis and any in-flight LLM generation, then
+  reopens the STT stream.
+- The `AgentSession` fires `speech_committed` / `speech_interrupted` events;
+  only text that was actually spoken out loud gets appended to the chat
+  context. This prevents the model from later "remembering" a half-spoken reply
+  that the user never heard.
+- Tuning to avoid false interrupts: raise `min_speech_duration` so short noises
+  (typing, coughs, background TV) don't trigger a cut-off, and set a short
+  post-speech silence threshold before letting the agent resume.
+- On the LLM plugin, `preemptive_generation=True` on the session lets the
+  agent start drafting a reply while the user is still finishing their turn,
+  which reduces perceived latency but must be balanced against the cost of
+  cancelled generations when the user extends their turn.
 
 ### Adding a second tool safely
 
-I already added `cancel_order` as a second tool in my implementation, so here's what I learned:
+The submitted agent already carries two tools (`get_order_status` and
+`cancel_order`) — the same shape applies to any additional tool:
 
-1. Make the tool names and descriptions clearly different — Gemini gets confused if two tools sound similar
-2. Always wrap tool execution in try/except. Don't let an exception crash the whole session. Return something like `"Sorry, couldn't process that — please try again"` so the LLM can relay it naturally
-3. Validate inputs inside the tool function before doing anything. I check order_id format with a simple regex
-4. If the LLM sends parallel tool calls (hasn't happened to me with Gemini yet, but it can), handle them sequentially — don't let one failure block the others
+1. **Schema clarity.** Give each tool a specific `name` and a docstring that
+   distinguishes it clearly from every other tool. Ambiguous descriptions are
+   the main cause of the LLM routing to the wrong tool.
+2. **Typed, minimal arguments.** LiveKit builds the JSON schema from the
+   method signature and docstring, so use narrow types (`str`, `int`, an
+   `enum`-shaped `Literal[...]`) and mark truly optional parameters as
+   optional. Anything left ambiguous will be filled in by the LLM's guess.
+3. **Never raise; always return.** A tool that raises kills the current
+   session turn. Wrap the tool body in `try / except` and return a plain
+   English error string (e.g. `"That order ID doesn't look right — could you
+   read it again?"`). The LLM will relay it to the user naturally.
+4. **Validate inputs before side effects.** For destructive actions
+   (`cancel_order`, `issue_refund`, `charge_card`), validate the ID format,
+   confirm the entity exists, and check any preconditions before mutating
+   state. In practice a lot of LLM-issued cancellations come with almost-right
+   IDs — `ORD 001` vs `ORD-001` etc.
+5. **Timeouts and idempotency.** External API calls inside a tool should have
+   a short client-side timeout so a slow backend doesn't stall the whole voice
+   turn. If the action can be retried, make it idempotent (client-generated
+   idempotency key) so a re-invocation from the LLM doesn't create a duplicate.
 
 ---
 
-## Section 2 — RAG Pipeline
+## Section 2 — LangChain RAG
 
-### What I'd change for longer documents
+### Improving retrieval on longer documents
 
-My current setup uses 500-char chunks with 50 overlap. Works fine for the 3 short docs I have, but would definitely break down on 50-page PDFs. Here's what I'd do differently:
+The current pipeline uses a `RecursiveCharacterTextSplitter` at 500 characters
+with 50-character overlap plus a similarity-score threshold on the FAISS
+retriever. That is fine for the three short markdown files here but would
+degrade on 50-page PDFs, contracts, or manuals. The main levers:
 
-**Chunking**: Switch to semantic chunking — split on actual section headers / paragraph boundaries instead of fixed character count. LangChain has `MarkdownHeaderTextSplitter` which I'd use for structured docs. For unstructured stuff (scanned PDFs etc), I'd try the `SemanticChunker` that groups by embedding similarity.
-
-**Retrieval**: Two things —
-1. Add BM25 alongside the dense embeddings (hybrid search). Dense search misses exact keyword matches sometimes — like if someone asks about "ORD-123" and the embedding doesn't capture that well. BM25 catches it.
-2. Re-ranking. Pull top-20 candidates with the cheap retrieval, then run them through a cross-encoder (I've used `cross-encoder/ms-marco-MiniLM-L-6-v2` before) to re-score. Much better precision.
-
-**Other ideas**: Metadata filtering (filter by doc section before retrieval), and maybe compressing retrieved chunks with an LLM before stuffing them into context. Haven't tried the compression thing in prod though, only read about it.
+- **Structure-aware chunking.** Fixed character sizes split mid-sentence and
+  mid-clause. On markdown / HTML, `MarkdownHeaderTextSplitter` (or an HTML
+  equivalent) preserves the section boundary, and attaches the heading path
+  as metadata for citation. On raw PDFs, chunking on paragraphs (double
+  newline) or sentences with a target token budget usually beats fixed size.
+- **Semantic chunking.** For unstructured text, split on embedding-similarity
+  drops — `SemanticChunker` groups adjacent sentences until the topic shifts.
+  Slower to ingest, but keeps coherent ideas together.
+- **Hybrid retrieval.** Combine dense (embedding) retrieval with a sparse
+  keyword retriever (BM25 or `bm25s`). Reciprocal-rank fusion merges the two
+  ranked lists. Dense catches paraphrases; BM25 catches exact IDs, product
+  names, statute numbers — the things embeddings routinely miss.
+- **Cross-encoder re-ranking.** Retrieve ~20 candidates cheaply, then re-score
+  with a cross-encoder such as `cross-encoder/ms-marco-MiniLM-L-6-v2` or a
+  Cohere `rerank` call. Precision at top-3 improves substantially, which is
+  what actually feeds the LLM.
+- **Metadata filters and hierarchical retrieval.** For long docs, tag chunks
+  with section / chapter / date metadata and let the retriever pre-filter.
+  For very large corpora, a two-stage design — coarse retrieval at doc level,
+  fine retrieval at chunk level — keeps latency and context length in check.
+- **Contextual compression.** After retrieval, run each chunk through a small
+  LLM that keeps only the sentences directly relevant to the query. This lets
+  more distinct chunks fit inside the context window without losing signal.
 
 ---
 
 ## Section 3 — Quantization
 
-### GPTQ/AWQ vs bitsandbytes vs GGUF — when to use what
+### GPTQ / AWQ vs bitsandbytes vs GGUF
 
-From my experience playing around with these:
+All three cut memory by roughly 4× at 4-bit, but they solve different
+problems:
 
-**bitsandbytes (NF4)**: My go-to for quick prototyping. Zero setup — just add `load_in_4bit=True` and you're done. But it's slow for actual serving because it dequantizes weights on every forward pass. Also great for QLoRA fine-tuning.
+**bitsandbytes (NF4).** Runtime quantization inside `transformers` — weights
+are stored 4-bit and dequantized on the fly during each forward pass.
+Advantages: zero calibration data, no separate build step, works for QLoRA
+fine-tuning. Disadvantage: slower inference than pre-quantized formats
+because of the dequant overhead per token.
 
-**GPTQ**: Better for production GPU serving. You need a calibration dataset (~128 samples) upfront which is annoying, but the resulting model is *statically* quantized — no runtime overhead. Pairs well with vLLM for batched inference.
+**GPTQ.** Post-training quantization with a small calibration set
+(typically 128–256 samples) that minimizes reconstruction error layer by
+layer. Produces a static 4-bit model with no runtime overhead. Works
+excellently with vLLM / TGI for batched serving. The main cost is the
+calibration step and the sensitivity of quality to how representative the
+calibration set is.
 
-**AWQ**: Similar to GPTQ but claims to preserve "salient" weights at higher precision. In my testing the quality difference vs GPTQ was marginal (maybe 1-2% on perplexity) but it's there. I'd pick AWQ over GPTQ if I'm deploying something customer-facing where quality matters.
+**AWQ (Activation-aware Weight Quantization).** Same shape as GPTQ, but
+identifies "salient" weights based on activation magnitudes and keeps those
+at higher precision. Typically edges out GPTQ by a small perplexity margin
+at the same bit-width. Same caveats about calibration.
 
-**GGUF (llama.cpp)**: For when you don't have a GPU at all, or you're running on a Mac. The Q4_K_M variant is the sweet spot — keeps attention layers at higher precision. I use this on my laptop for local testing.
+**GGUF (llama.cpp).** A container format plus a family of quantization
+schemes (Q4_K_M, Q5_K_M, Q8_0, …). Optimized for CPU / Metal / mixed
+CPU-GPU. Q4_K_M keeps attention and value layers at a higher precision than
+the FFN, which preserves quality noticeably. Best fit for laptops, phones,
+edge devices, or servers that need to run models without a GPU. Not the
+right choice for high-throughput GPU batch serving.
 
-**My rule of thumb**:
-- Just experimenting → bitsandbytes
-- Shipping a GPU API → AWQ + vLLM
-- Need it to run anywhere (CPU, phones, edge) → GGUF
-- Budget cloud deployment → GPTQ + TGI (battle-tested)
+**Rules of thumb:**
 
-The key difference people miss: bitsandbytes is *runtime* quantization (slow), GPTQ/AWQ/GGUF are *pre-computed* (fast at inference).
+- Prototyping or fine-tuning → bitsandbytes (zero setup)
+- Production GPU serving with high throughput → AWQ (or GPTQ) + vLLM
+- Cost-sensitive cloud with batching → GPTQ + TGI
+- CPU / on-device / heterogeneous hardware → GGUF Q4_K_M via llama.cpp
+
+The core distinction people miss: **bitsandbytes dequantizes at runtime,
+GPTQ/AWQ/GGUF store already-quantized kernels.** That's why the three
+pre-quantized formats are always faster at pure inference than bitsandbytes
+for the same bit-width.
 
 ---
 
@@ -69,18 +136,44 @@ The key difference people miss: bitsandbytes is *runtime* quantization (slow), G
 
 ### Scaling to 50 concurrent users
 
-Right now my FastAPI server handles maybe 3-5 requests before latency goes through the roof. Here's what I'd change:
+The submitted setup — a single FastAPI process wrapping raw `transformers` —
+serializes generations on the GPU and starts queuing (or OOMing) somewhere
+around 3–5 concurrent long generations on a T4. To handle 50 concurrent
+users, roughly the following stack:
 
-**Step 1 — Switch inference engine**: Drop raw `transformers` for vLLM. It does continuous batching (PagedAttention) which means it processes multiple requests at the token level instead of one-at-a-time. Easily 5-10x better throughput.
+**Continuous batching first.** Replace `transformers.generate` with vLLM (or
+TGI). vLLM's PagedAttention batches requests at the *token* level rather than
+the request level — a new request can join an in-flight batch on the next
+step instead of waiting for the previous batch to finish. On the same T4,
+that alone is typically 5–10× throughput.
 
-**Step 2 — Add a queue**: Put Redis or RabbitMQ between the API gateway and the inference workers. When 50 people hit the endpoint at once, you don't want them all fighting for GPU memory. Queue them, process in batches.
+**Streaming as a first-class citizen.** Keep the SSE endpoint. Streaming
+cuts perceived latency (users see tokens immediately) and lets the server
+release memory as soon as a client disconnects, which matters under load.
 
-**Step 3 — Horizontal scaling**: Run 2-3 replicas behind a load balancer. Kubernetes with HPA (scaling on GPU utilization or queue depth) works well. Each pod gets one T4/A10 GPU.
+**Prefix caching.** If every request shares a long system prompt (RAG
+context, few-shot examples), vLLM's prefix cache avoids re-computing the KV
+for that prefix across requests. Big win for RAG-heavy workloads.
 
-**Step 4 — Caching**: For common queries, cache at the semantic level — embed the query, check if something with >0.95 similarity was answered before, return cached response. Saves a ton of compute.
+**Horizontal scaling.** Behind a load balancer (Kubernetes with HPA on GPU
+utilization + p95 latency, or ECS + ALB). For 50 users on a 1.5B model,
+2–3 replicas on T4 / A10G is typically comfortable; for a 7B model, 3–4
+replicas or a step up to A10G / L4.
 
-**Step 5 — Streaming**: Already implemented this, but it matters more at scale. Users see tokens immediately → perceived latency drops, and you free GPU memory earlier since partial responses flush.
+**Queue between edge and inference.** A Redis / RabbitMQ queue absorbs spikes
+and lets you cap concurrent in-flight requests per replica, which prevents
+OOM under bursty load.
 
-Honestly for 50 users with a 1.5B model on a T4, I think 2 replicas with vLLM would handle it comfortably. If it were a 7B model, you'd probably need 3-4 replicas or switch to A10 GPUs.
+**Semantic response cache.** Embed the incoming query, look up an existing
+answer with cosine ≥ 0.95, return that instead of regenerating. In practice
+this covers a meaningful fraction of duplicate customer-support-style
+queries and saves both cost and latency.
 
-The stack I'd actually deploy: **K8s + vLLM (AWQ model) + Nginx + Redis + Prometheus/Grafana**. Maybe Triton inference server if you need multi-model serving.
+**Observability.** Expose Prometheus metrics for TTFT, tokens/sec,
+concurrent-request count, and queue depth; alert on p95 latency regression.
+Without this you can't tell whether you actually need more replicas or the
+current ones are just poorly configured.
+
+Concrete production stack for this workload: **Kubernetes + vLLM (AWQ 4-bit
+Qwen or similar) + NGINX ingress + Redis queue + Prometheus / Grafana +
+horizontal-pod-autoscaler on request-queue depth.**
