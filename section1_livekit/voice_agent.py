@@ -1,170 +1,198 @@
 """
-voice_agent.py — QuickBite support agent (Gemini)
+voice_agent.py — QuickBite food-delivery voice agent
 
-Uses Google Gemini for LLM + function calling.
-STT/TTS mocked with text I/O.
+Uses the livekit-agents Python SDK:
+  - Agent subclass with a system persona (instructions=...)
+  - Two @function_tool-decorated async methods (get_order_status, cancel_order)
+  - An entrypoint() showing the AgentSession pipeline (STT -> LLM -> TTS)
+
+Run modes:
+  1. Real LiveKit worker (needs a LiveKit server + STT/TTS provider keys):
+         python voice_agent.py dev
+  2. Demo mode (no LiveKit server needed, drives the LLM + tools directly):
+         python run_simulation.py
 """
 
+from __future__ import annotations
+
+import logging
 import os
-import re
-from dataclasses import dataclass
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
+# Load .env from the repo root (one level above this file)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    RunContext,
+    WorkerOptions,
+    cli,
+    function_tool,
+)
+from livekit.plugins import google as lk_google
+
+logger = logging.getLogger("quickbite-agent")
 
 
-@dataclass
-class TranscriptionEvent:
-    text: str
+# --------------------------------------------------------------------------- #
+# Mocked "database" — replace with a real service call in production.
+# --------------------------------------------------------------------------- #
 
-class MockSTT:
-    async def transcribe(self, text):
-        return TranscriptionEvent(text=text)
-
-class MockTTS:
-    async def synthesize(self, text):
-        return text
-
-
-# --- order db ---
-ORDER_DB = {
-    "ORD-001": {"status": "delivered", "eta": None, "restaurant": "Pizza Palace", "items": ["Margherita Pizza", "Garlic Bread"]},
-    "ORD-002": {"status": "in_transit", "eta": "15 minutes", "restaurant": "Burger Barn", "items": ["Double Cheeseburger", "Fries"]},
-    "ORD-003": {"status": "preparing", "eta": "30 minutes", "restaurant": "Sushi Spot", "items": ["California Roll", "Miso Soup"]},
-    "ORD-004": {"status": "cancelled", "eta": None, "restaurant": "Taco Town", "items": ["Burrito Bowl"]},
+ORDER_DB: dict[str, dict] = {
+    "ORD-001": {
+        "status": "delivered",
+        "eta": None,
+        "restaurant": "Pizza Palace",
+        "items": ["Margherita Pizza", "Garlic Bread"],
+    },
+    "ORD-002": {
+        "status": "in_transit",
+        "eta": "15 minutes",
+        "restaurant": "Burger Barn",
+        "items": ["Double Cheeseburger", "Fries"],
+    },
+    "ORD-003": {
+        "status": "preparing",
+        "eta": "30 minutes",
+        "restaurant": "Sushi Spot",
+        "items": ["California Roll", "Miso Soup"],
+    },
+    "ORD-004": {
+        "status": "cancelled",
+        "eta": None,
+        "restaurant": "Taco Town",
+        "items": ["Burrito Bowl"],
+    },
 }
 
 
-def get_order_status(order_id: str) -> str:
-    """Look up order status."""
-    order_id = order_id.strip().upper()
-    order = ORDER_DB.get(order_id)
-    if not order:
-        return f"No order found with ID '{order_id}'."
-    s = order["status"]
-    r = order["restaurant"]
-    items = ", ".join(order["items"])
-    if s == "in_transit":
-        return f"{order_id} from {r} is on its way — ETA {order['eta']}. Items: {items}"
-    elif s == "preparing":
-        return f"{order_id} from {r} is being prepared. ETA: {order['eta']}. Items: {items}"
-    elif s == "delivered":
-        return f"{order_id} from {r} was delivered. Items: {items}"
-    elif s == "cancelled":
-        return f"{order_id} has been cancelled."
-    return f"{order_id}: status '{s}'"
-
-
-def cancel_order(order_id: str, reason: str) -> str:
-    """Cancel an order."""
-    order_id = order_id.strip().upper()
-    order = ORDER_DB.get(order_id)
-    if not order:
-        return f"Can't find order '{order_id}'."
-    if order["status"] == "delivered":
-        return f"{order_id} already delivered, can't cancel."
-    if order["status"] == "cancelled":
-        return f"{order_id} is already cancelled."
-    ORDER_DB[order_id]["status"] = "cancelled"
-    return f"{order_id} cancelled. Reason: {reason}. Refund in 3-5 days."
-
-
-TOOL_FNS = {"get_order_status": get_order_status, "cancel_order": cancel_order}
-
 SYSTEM_PROMPT = (
-    "You are a friendly support agent for QuickBite food delivery. "
-    "Help customers check order status and cancel orders. "
-    "Use the tools provided. Keep responses short."
+    "You are a friendly customer-support assistant for QuickBite, a food delivery app. "
+    "You help customers check order status and cancel orders. "
+    "Always use the provided tools to look up order information — never guess. "
+    "Keep replies short, conversational, and easy to say out loud."
 )
 
 
-class FoodDeliveryAgent:
-    """Agent using Gemini function calling."""
+# --------------------------------------------------------------------------- #
+# Agent definition
+# --------------------------------------------------------------------------- #
 
-    def __init__(self):
-        self.stt = MockSTT()
-        self.tts = MockTTS()
 
-        from google import genai
-        from google.genai import types
+class QuickBiteAgent(Agent):
+    """Voice agent for QuickBite customer support.
 
-        self.types = types
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        self.client = genai.Client(api_key=api_key)
+    The @function_tool-decorated methods below are automatically registered
+    with the LLM and exposed as callable tools during a session.
+    """
 
-        tool_decls = types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name="get_order_status",
-                description="Look up current status of a food delivery order",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={"order_id": types.Schema(type=types.Type.STRING, description="e.g. ORD-001")},
-                    required=["order_id"],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="cancel_order",
-                description="Cancel a pending food delivery order",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "order_id": types.Schema(type=types.Type.STRING),
-                        "reason": types.Schema(type=types.Type.STRING, description="Why cancelling"),
-                    },
-                    required=["order_id", "reason"],
-                ),
-            ),
-        ])
-
-        self.chat = self.client.chats.create(
-            model="gemini-2.0-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=[tool_decls],
-            ),
+    def __init__(self) -> None:
+        super().__init__(
+            instructions=SYSTEM_PROMPT,
+            # Gemini works well for tool-calling and is inexpensive.
+            # Swap this out for openai.LLM / anthropic.LLM etc. as needed.
+            llm=lk_google.LLM(model="gemini-2.0-flash"),
         )
-        print("[init] Gemini connected")
 
-    async def process_user_input(self, user_text: str) -> str:
-        transcript = await self.stt.transcribe(user_text)
-        print(f'\n  [user] "{transcript.text}"')
+    @function_tool
+    async def get_order_status(self, context: RunContext, order_id: str) -> str:
+        """Look up the current status of a food delivery order.
 
-        reply = self._gemini_turn(transcript.text)
+        Args:
+            order_id: The order identifier (e.g. "ORD-001").
+        """
+        logger.info("get_order_status(order_id=%s)", order_id)
+        oid = order_id.strip().upper()
+        order = ORDER_DB.get(oid)
+        if order is None:
+            return (
+                f"I couldn't find an order with the ID {oid}. "
+                "Could you double-check the number?"
+            )
 
-        await self.tts.synthesize(reply)
-        print(f'  [agent] "{reply}"')
-        return reply
+        status = order["status"]
+        restaurant = order["restaurant"]
+        items = ", ".join(order["items"])
 
-    def _gemini_turn(self, text: str) -> str:
-        types = self.types
-        response = self.chat.send_message(text)
+        if status == "in_transit":
+            return (
+                f"Order {oid} from {restaurant} is on the way. "
+                f"ETA is about {order['eta']}. Items: {items}."
+            )
+        if status == "preparing":
+            return (
+                f"Order {oid} from {restaurant} is being prepared. "
+                f"It should be ready in about {order['eta']}. Items: {items}."
+            )
+        if status == "delivered":
+            return f"Order {oid} from {restaurant} was already delivered. Items: {items}."
+        if status == "cancelled":
+            return f"Order {oid} has been cancelled."
+        return f"Order {oid} has status: {status}."
 
-        for _ in range(5):  # safety limit
-            fc_found = False
-            for part in response.candidates[0].content.parts:
-                if part.function_call:
-                    fc_found = True
-                    name = part.function_call.name
-                    args = dict(part.function_call.args)
-                    print(f"  [tool] {name}({args})")
+    @function_tool
+    async def cancel_order(
+        self, context: RunContext, order_id: str, reason: str
+    ) -> str:
+        """Cancel a pending food delivery order.
 
-                    fn = TOOL_FNS.get(name)
-                    result = fn(**args) if fn else f"Unknown tool: {name}"
-                    print(f"  [result] {result}")
+        Only orders that have not yet been delivered can be cancelled.
 
-                    response = self.chat.send_message(
-                        types.Content(parts=[
-                            types.Part(function_response=types.FunctionResponse(
-                                name=name, response={"result": result}
-                            ))
-                        ])
-                    )
-                    break
-            if not fc_found:
-                break
+        Args:
+            order_id: The order identifier (e.g. "ORD-001").
+            reason: The customer's reason for cancelling.
+        """
+        logger.info("cancel_order(order_id=%s, reason=%s)", order_id, reason)
+        oid = order_id.strip().upper()
+        order = ORDER_DB.get(oid)
+        if order is None:
+            return f"I couldn't find order {oid}, so there's nothing to cancel."
+        if order["status"] == "delivered":
+            return (
+                f"Order {oid} has already been delivered, so it can't be cancelled. "
+                "If there's a problem with the order, I can help with a refund instead."
+            )
+        if order["status"] == "cancelled":
+            return f"Order {oid} was already cancelled."
 
-        return response.text
+        ORDER_DB[oid]["status"] = "cancelled"
+        return (
+            f"Order {oid} is now cancelled. Reason: {reason}. "
+            "You should see the refund in 3-5 business days."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Production entrypoint (real LiveKit worker)
+# --------------------------------------------------------------------------- #
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    """Standard LiveKit worker entrypoint.
+
+    In production, replace the STT/TTS below with real provider plugins
+    (deepgram, elevenlabs, openai, google, cartesia, etc.). The AgentSession
+    wires them together as an STT -> LLM -> TTS pipeline.
+
+    Provider swaps require ONLY changing the two lines below — the Agent
+    subclass, its tools, and the system prompt stay identical.
+    """
+    from livekit.plugins import deepgram, elevenlabs, silero
+
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-3"),
+        # LLM is set on the Agent itself, but you can override here too.
+        tts=elevenlabs.TTS(),
+        vad=silero.VAD.load(),
+    )
+
+    await session.start(agent=QuickBiteAgent(), room=ctx.room)
+    await ctx.connect()
 
 
 if __name__ == "__main__":
-    print("Run `python run_simulation.py` for the demo.")
+    # Running this file directly starts a real LiveKit worker.
+    # For a demo without a LiveKit room, run: python run_simulation.py
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
