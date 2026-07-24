@@ -63,12 +63,13 @@ python run_simulation.py
 
 ## API key
 
-I'm using **xAI Grok** (OpenAI-compatible) for sections 1 & 2.
+I'm using **Google Gemini** (free tier, no credit card) for sections 1 & 2.
+
+Get a key: https://aistudio.google.com/apikey
 
 Put it in `.env`:
 ```
-XAI_API_KEY=xai-...
-XAI_BASE_URL=https://api.x.ai/v1
+GOOGLE_API_KEY=your_key_here
 ```
 
 The `.gitignore` blocks `.env` so it won't get pushed to GitHub.
